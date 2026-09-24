@@ -1,12 +1,12 @@
 /**
- * Cloudflare Email Worker — Fiverr order -> Discord thread.
+ * Cloudflare Email Worker — Fiverr order -> Discord forum post.
  *
  * Setup:
  *   1. Domain must be on Cloudflare DNS with Email Routing enabled.
  *   2. Create a custom address (e.g. fiverr-orders@yourdomain.com) and
  *      route it to this Worker (Email Routing -> Routing Rules).
- *   3. In Proton, add a filter that forwards Fiverr order emails to that
- *      address (Proton will require you to verify it once).
+ *   3. In Proton, add a forwarding rule that sends Fiverr order emails to
+ *      that address (Proton requires a one-time confirmation).
  *   4. wrangler secret put DISCORD_WEBHOOK_URL
  *      wrangler secret put DESIGNER_MENTION   (e.g. "<@123456789012345678>" for a user,
  *                                               or "<@&123456789012345678>" for a role —
@@ -14,13 +14,6 @@
  *      wrangler secret put FORUM_TAG_IDS      (JSON string mapping category/package
  *                                               names to Discord forum tag IDs, e.g.
  *                                               {"Banner":"123...","Premium":"456..."})
- *
- *      Forum tags don't have a UI "copy ID" option. To find the IDs:
- *        - Create a temporary bot, invite it to the server (View Channels perm is enough)
- *        - curl -H "Authorization: Bot YOUR_BOT_TOKEN" \
- *               https://discord.com/api/v10/channels/YOUR_FORUM_CHANNEL_ID
- *        - Read the "available_tags" array in the response: each has "id" and "name"
- *
  *   5. npm install postal-mime
  *   6. wrangler deploy
  *
@@ -36,6 +29,7 @@
  *   The buyer has provided the following order requirements:
  *   <full Q&A block>
  *
+ * Forum post title format: G-[order type code]-[order id] -- [customer name]
  * If Fiverr changes this template, only parseFiverrOrder() needs updating.
  */
 
@@ -89,9 +83,20 @@ const CATEGORY_MAP = [
   [/banner/i, "Banner"],
   [/profile picture|pfp/i, "Profile Picture"],
   [/wallpaper/i, "Wallpaper"],
-	[/thumbnail/i, "Thumbnail"],
-  [/render/i, "Render"]
+  [/thumbnail/i, "Thumbnail"],
+  [/render/i, "Render"],
+  [/custom/i, "Custom"],
 ];
+
+// Short codes used in the forum post title (G-[code]-[order id])
+const CATEGORY_CODE = {
+  "Banner": "BN",
+  "Thumbnail": "TH",
+  "Wallpaper": "WP",
+  "Render": "TR",
+  "Custom": "CT",
+  "Profile Picture": "PP",
+};
 
 const PACKAGE_MAP = [
   [/diamond/i, "Premium"],
@@ -113,8 +118,24 @@ function parseFiverrOrder(text) {
   const priceStr = matchOne(text, /Total:\s*\$([0-9,.]+)/i);
 
   const reqIdx = text.indexOf(REQUIREMENTS_MARKER);
-  const requirementsBody =
+  let requirementsBody =
     reqIdx !== -1 ? text.slice(reqIdx + REQUIREMENTS_MARKER.length).trim() : null;
+
+  // Truncate everything after the link following "Review Requirements"
+  if (requirementsBody) {
+    const reviewIdx = requirementsBody.search(/review requirements/i);
+    if (reviewIdx !== -1) {
+      const afterReview = requirementsBody.slice(reviewIdx);
+      const urlMatch = afterReview.match(/https?:\/\/[^\s<>"]+/i);
+
+      if (urlMatch) {
+        const cutIndex = reviewIdx + urlMatch.index + urlMatch[0].length;
+        requirementsBody = requirementsBody.slice(0, cutIndex).trim();
+      } else {
+        requirementsBody = requirementsBody.slice(0, reviewIdx).trim();
+      }
+    }
+  }
 
   const dueDate = dueDateStr ? new Date(dueDateStr) : null;
   const daysLeft =
@@ -135,27 +156,62 @@ function parseFiverrOrder(text) {
 }
 
 function buildThreadName(order) {
-  const name = `${order.category} - ${order.packageTier}${order.buyer ? ` (${order.buyer})` : ""}`;
-  return name.slice(0, 100);
+  const code = CATEGORY_CODE[order.category] || "XX";
+  const orderId = order.orderId || "UNKNOWN";
+  const buyer = order.buyer || "unknown";
+  return `G-${code}-${orderId} -- ${buyer}`.slice(0, 100);
+}
+
+// Turns Fiverr's numbered Q&A block into bolded questions with
+// block-quoted answers, e.g.:
+//   **1. What do you want...?**
+//   > My rough idea is...
+function formatRequirements(raw) {
+  const blocks = raw
+    .split(/\n(?=\d+\.\s)/g)
+    .map((b) => b.trim())
+    .filter(Boolean);
+
+  return blocks
+    .map((block) => {
+      const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
+      const question = lines[0];
+      const answerLines = lines.slice(1);
+      let formatted = `**${question}**`;
+      if (answerLines.length > 0) {
+        formatted += "\n" + answerLines.map((l) => `> ${l}`).join("\n");
+      }
+      return formatted;
+    })
+    .join("\n\n");
 }
 
 function buildDiscordContent(order, designerMention) {
   const parts = [];
-  parts.push(designerMention || "@Klc"); // plain "@Klc" text won't actually ping — see setup notes
+
+  if (designerMention) parts.push(designerMention); // plain "@Klc" text won't ping — see setup notes
+
+  parts.push(`# ${order.category} Order — ${order.packageTier}`);
   parts.push("");
-  parts.push(`Order ${order.category} - ${order.packageTier}`);
+  parts.push(`**Buyer:** ${order.buyer ?? "unknown"}`);
+
+  const deadline = order.dueDateStr
+    ? `**Deadline:** ${order.dueDateStr}` +
+      (order.daysLeft != null
+        ? ` _(${order.daysLeft} day${order.daysLeft === 1 ? "" : "s"} left)_`
+        : "")
+    : "**Deadline:** unknown";
+  parts.push(deadline);
+
+  parts.push("");
+  parts.push("---");
+  parts.push("");
+  parts.push("**Requirements**");
   parts.push("");
 
   if (order.requirementsBody) {
-    parts.push(order.requirementsBody);
-    parts.push("");
+    parts.push(formatRequirements(order.requirementsBody));
   }
-
-  const deadline = order.dueDateStr
-    ? `Deadline: ${order.dueDateStr}` +
-      (order.daysLeft != null ? ` (${order.daysLeft} day${order.daysLeft === 1 ? "" : "s"} left)` : "")
-    : "Deadline: unknown";
-  parts.push(deadline);
 
   let content = parts.join("\n");
   if (content.length > DISCORD_CONTENT_LIMIT) {
