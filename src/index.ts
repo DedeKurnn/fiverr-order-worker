@@ -117,7 +117,9 @@ function detect(map, titleLine, fallback = "Unknown") {
 }
 
 function parseFiverrOrder(text) {
-  const buyer = matchOne(text, /order from ([A-Za-z0-9_.\-]+)/i);
+  const buyer =
+    matchOne(text, /order from ([A-Za-z0-9_.\-]+)!/i) ||
+    matchOne(text, /order from ([A-Za-z0-9_.\-]+)/i);
   const orderId = matchOne(text, /Order #(\S+)/i);
   const dueDateStr =
     matchOne(text, /due\s+(?:by\s+|on\s+)?([A-Za-z]+\s+\d{1,2},\s*\d{4})/i) ||
@@ -129,17 +131,15 @@ function parseFiverrOrder(text) {
   let requirementsBody =
     reqIdx !== -1 ? text.slice(reqIdx + REQUIREMENTS_MARKER.length).trim() : null;
 
-  // Truncate everything after the link following "Review Requirements"
+  // Drop Fiverr's trailing boilerplate ("Got everything you need? Review
+  // Requirements <link> ...") entirely rather than keeping any of it.
   if (requirementsBody) {
-    const reviewIdx = requirementsBody.search(/review requirements/i);
-    if (reviewIdx !== -1) {
-      const afterReview = requirementsBody.slice(reviewIdx);
-      const urlMatch = afterReview.match(/https?:\/\/[^\s<>"]+/i);
-
-      if (urlMatch) {
-        const cutIndex = reviewIdx + urlMatch.index + urlMatch[0].length;
-        requirementsBody = requirementsBody.slice(0, cutIndex).trim();
-      } else {
+    const boilerplateIdx = requirementsBody.search(/got everything you need\?/i);
+    if (boilerplateIdx !== -1) {
+      requirementsBody = requirementsBody.slice(0, boilerplateIdx).trim();
+    } else {
+      const reviewIdx = requirementsBody.search(/review requirements/i);
+      if (reviewIdx !== -1) {
         requirementsBody = requirementsBody.slice(0, reviewIdx).trim();
       }
     }
@@ -175,19 +175,34 @@ function buildThreadName(order) {
 //   **1. What do you want...?**
 //   > My rough idea is...
 function formatRequirements(raw) {
-  const blocks = raw
-    .split(/\n(?=\d+\.\s)/g)
-    .map((b) => b.trim())
-    .filter(Boolean);
+  const itemRegex = /(?:^|\s)(\d+)\.\s+/g;
+  const matches = [...raw.matchAll(itemRegex)];
+  if (matches.length === 0) return raw.trim();
 
-  return blocks
-    .map((block) => {
-      const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
-      const question = lines[0];
-      const answerLines = lines.slice(1);
-      let formatted = `**${question}**`;
-      if (answerLines.length > 0) {
-        formatted += "\n" + answerLines.map((l) => `> ${l}`).join("\n");
+  const items = matches.map((m, i) => {
+    const contentStart = m.index + m[0].length;
+    const contentEnd = i + 1 < matches.length ? matches[i + 1].index : raw.length;
+    return { number: m[1], body: raw.slice(contentStart, contentEnd).trim() };
+  });
+
+  return items
+    .map(({ number, body }) => {
+      // Most items are phrased as a question; split on the '?' so only the
+      // question itself gets bolded and the rest is quoted as the answer.
+      // Items with no '?' (e.g. the file-upload one) bold the whole line.
+      const qMarkIdx = body.indexOf("?");
+      let question, answer;
+      if (qMarkIdx !== -1) {
+        question = body.slice(0, qMarkIdx + 1).trim();
+        answer = body.slice(qMarkIdx + 1).trim();
+      } else {
+        question = body;
+        answer = "";
+      }
+
+      let formatted = `**${number}. ${question}**`;
+      if (answer) {
+        formatted += `\n> ${answer.replace(/\s*\n+\s*/g, " ").trim()}`;
       }
       return formatted;
     })
@@ -202,7 +217,6 @@ function buildDiscordContent(order, designerMention) {
   parts.push(`# ${order.category} Order — ${order.packageTier}`);
   parts.push("");
   parts.push(`**Buyer:** ${order.buyer ?? "unknown"}`);
-  parts.push(`**Price:** $${order.price ?? "?"}`);
 
   const deadline = order.dueDateStr
     ? `**Deadline:** ${order.dueDateStr}` +
