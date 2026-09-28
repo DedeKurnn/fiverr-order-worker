@@ -17,20 +17,9 @@
  *   5. npm install postal-mime
  *   6. wrangler deploy
  *
- * Parsing is built against this real Fiverr order-notification format:
- *
- *   Hi <seller>,
- *   You've just received an order from <buyer>! Feels good, right?
- *   Order #<id> is due <Month DD, YYYY>.
- *   ...
- *   I will <title with "- X Package">:
- *   ...
- *   Total: $<amount>
- *   The buyer has provided the following order requirements:
- *   <full Q&A block>
- *
  * Forum post title format: G-[order type code]-[order id] -- [customer name]
- * If Fiverr changes this template, only parseFiverrOrder() needs updating.
+ * If Fiverr changes its email template, parseFiverrOrder() /
+ * formatRequirements() are the only places that need updating.
  */
 
 import PostalMime from "postal-mime";
@@ -48,8 +37,17 @@ export default {
       return;
     }
 
-    const text = normalizeWhitespace(parsed.text || stripHtml(parsed.html || ""));
+    // Use the plain-text part only if it kept its line breaks; otherwise
+    // rebuild text from the HTML so the block structure survives.
+    const useText = Boolean(parsed.text && parsed.text.includes("\n"));
+    const text = normalizeWhitespace(
+      useText ? parsed.text : htmlToText(parsed.html || parsed.text || "")
+    );
     const order = parseFiverrOrder(text);
+
+    // DEBUG (remove once formatting is confirmed): shows the raw requirements
+    // text with visible \n so parsing problems can be diagnosed via `wrangler tail`.
+    console.log("SOURCE:", useText ? "text" : "html", "REQ_RAW:", JSON.stringify(order.requirementsBody));
 
     let tagIds = {};
     try {
@@ -70,8 +68,26 @@ export default {
   },
 };
 
-function stripHtml(html) {
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+// HTML -> text that keeps block structure (line breaks) and decodes entities.
+function htmlToText(html) {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/\s+/g, " ") // source-code whitespace is insignificant in HTML
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|td|th|h[1-6]|table|ul|ol|blockquote)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&amp;/gi, "&")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
 }
 
 function normalizeWhitespace(text) {
@@ -124,7 +140,8 @@ function parseFiverrOrder(text) {
   const dueDateStr =
     matchOne(text, /due\s+(?:by\s+|on\s+)?([A-Za-z]+\s+\d{1,2},\s*\d{4})/i) ||
     matchOne(text, /([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})/);
-  const titleLine = matchOne(text, /I will (.+)/i);
+  // Only the gig-title line, so words in the requirements can't affect detection
+  const titleLine = matchOne(text, /I will ([^\n]+)/i);
   const priceStr = matchOne(text, /Total:\s*\$([0-9,.]+)/i);
 
   const reqIdx = text.indexOf(REQUIREMENTS_MARKER);
@@ -170,39 +187,96 @@ function buildThreadName(order) {
   return `G-${code}-${orderId} -- ${buyer}`.slice(0, 100);
 }
 
-// Turns Fiverr's numbered Q&A block into bolded questions with
-// block-quoted answers, e.g.:
-//   **1. What do you want...?**
-//   > My rough idea is...
-function formatRequirements(raw) {
-  const itemRegex = /(?:^|\s)(\d+)\.\s+/g;
-  const matches = [...raw.matchAll(itemRegex)];
-  if (matches.length === 0) return raw.trim();
+// ---------------------------------------------------------------------------
+// Requirements formatting
+//
+// Fiverr lists each requirement as a question followed by the buyer's answer.
+// Long questions are cut at ~80 chars with an ellipsis, may carry a
+// "For example : ..." hint, and may be hard-wrapped over several lines — so a
+// question can span multiple lines. Numbering ("1.", "2.") may or may not be
+// present. Strategy: group lines into question lines + answer lines.
+// ---------------------------------------------------------------------------
 
-  const items = matches.map((m, i) => {
-    const contentStart = m.index + m[0].length;
-    const contentEnd = i + 1 < matches.length ? matches[i + 1].index : raw.length;
-    return { number: m[1], body: raw.slice(contentStart, contentEnd).trim() };
+const WRAP_LEN = 55; // a line this long without end punctuation probably wraps
+const QUESTION_END_RE = /(\?|…|\.{3})\s*$/;
+const TERMINATOR_RE = /[?…!.:]\s*$/;
+const HINT_START_RE = /^(for example|e\.g\.?|eg:)/i;
+
+function questionContinues(line, nextLine) {
+  if (!nextLine) return false;
+  if (HINT_START_RE.test(nextLine)) return true; // "For example : ..." hint line
+  return line.length >= WRAP_LEN && !TERMINATOR_RE.test(line); // hard-wrapped question
+}
+
+function parseRequirementItems(raw) {
+  const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  const items = [];
+  let current = null;
+  let inQuestion = false;
+  let numbered = false;
+
+  const startItem = () => {
+    current = { question: [], answer: [] };
+    items.push(current);
+    inQuestion = true;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Number marker: "1." alone, or "1. Question..." — only the next number in sequence
+    const num = line.match(/^(\d+)\.\s*(.*)$/);
+    if (num && Number(num[1]) === items.length + 1) {
+      numbered = true;
+      startItem();
+      line = num[2];
+      if (!line) continue;
+    } else if (!current) {
+      startItem();
+    } else if (!inQuestion && !numbered && QUESTION_END_RE.test(line) && line.length <= 120) {
+      startItem(); // unnumbered format: a new question line starts the next item
+    }
+
+    if (inQuestion) {
+      current.question.push(line);
+      if (!questionContinues(line, lines[i + 1])) inQuestion = false;
+    } else {
+      current.answer.push(line);
+    }
+  }
+  return items;
+}
+
+// Re-join hard-wrapped answer lines with a space, keep intentional breaks.
+function joinWrapped(lines) {
+  let out = "";
+  lines.forEach((line, i) => {
+    if (i === 0) {
+      out = line;
+      return;
+    }
+    const prev = lines[i - 1];
+    const wrapped = prev.length >= WRAP_LEN && !TERMINATOR_RE.test(prev);
+    out += (wrapped ? " " : "\n") + line;
   });
+  return out;
+}
+
+function formatRequirements(raw) {
+  const items = parseRequirementItems(raw);
+  if (items.length === 0) return raw.trim();
 
   return items
-    .map(({ number, body }) => {
-      // Most items are phrased as a question; split on the '?' so only the
-      // question itself gets bolded and the rest is quoted as the answer.
-      // Items with no '?' (e.g. the file-upload one) bold the whole line.
-      const qMarkIdx = body.indexOf("?");
-      let question, answer;
-      if (qMarkIdx !== -1) {
-        question = body.slice(0, qMarkIdx + 1).trim();
-        answer = body.slice(qMarkIdx + 1).trim();
-      } else {
-        question = body;
-        answer = "";
-      }
-
-      let formatted = `**${number}. ${question}**`;
-      if (answer) {
-        formatted += `\n> ${answer.replace(/\s*\n+\s*/g, " ").trim()}`;
+    .map((item, idx) => {
+      const question = item.question.join(" ");
+      let formatted = `**${idx + 1}. ${question}**`;
+      if (item.answer.length > 0) {
+        formatted +=
+          "\n" +
+          joinWrapped(item.answer)
+            .split("\n")
+            .map((l) => `> ${l}`)
+            .join("\n");
       }
       return formatted;
     })
@@ -248,11 +322,24 @@ function resolveAppliedTags(order, tagIds) {
   return [tagIds[order.category], tagIds[order.packageTier]].filter(Boolean).slice(0, 5);
 }
 
+// Buyer-written text ends up in the message, so only the designer mention may
+// ping — a buyer typing "@everyone" must not.
+function buildAllowedMentions(mention) {
+  const users = [];
+  const roles = [];
+  const u = mention && mention.trim().match(/^<@!?(\d+)>$/);
+  const r = mention && mention.trim().match(/^<@&(\d+)>$/);
+  if (u) users.push(u[1]);
+  if (r) roles.push(r[1]);
+  return { parse: [], users, roles };
+}
+
 async function postToDiscord(order, webhookUrl, mention, tagIds) {
   const payload = {
     content: buildDiscordContent(order, mention),
     // Only creates a forum post if the webhook's channel is a Forum channel.
     thread_name: buildThreadName(order),
+    allowed_mentions: buildAllowedMentions(mention),
   };
 
   const appliedTags = resolveAppliedTags(order, tagIds);
